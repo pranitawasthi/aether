@@ -1,22 +1,76 @@
 use std::{collections::HashMap, sync::Arc};
 
+use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
     agent::{Agent, AgentId},
     error::{Result, RuntimeError},
+    memory::{MemoryManager, MemoryRecord, MemoryScope, MemoryWrite, SemanticMatch},
+    sandbox::{SandboxManager, SandboxStatus},
     scheduler::{Scheduler, SharedTask},
-    task::{Task, TaskId},
-    tool::{PermissionSet, ToolConfig, ToolDescriptor, ToolExecutor, ToolRequest, ToolResult},
+    task::{Task, TaskId, TaskKind, TaskResult},
+    tool::{PermissionSet, ToolConfig, ToolDescriptor, ToolExecutor, ToolRequest},
     worker::{TaskExecutor, WorkerPool},
 };
+
+type AgentStore = Arc<Mutex<HashMap<AgentId, Arc<Mutex<Agent>>>>>;
+
+struct RuntimeTaskExecutor {
+    generic_executor: Arc<dyn TaskExecutor>,
+    agents: AgentStore,
+    tools: ToolExecutor,
+}
+
+#[async_trait]
+impl TaskExecutor for RuntimeTaskExecutor {
+    async fn execute(&self, task: &Task) -> Result<TaskResult> {
+        if task.kind == TaskKind::Generic {
+            return self.generic_executor.execute(task).await;
+        }
+
+        let agent_id = task.agent_id.ok_or_else(|| {
+            RuntimeError::Execution("tool tasks must be owned by an agent".to_owned())
+        })?;
+        let agent = self
+            .agents
+            .lock()
+            .await
+            .get(&agent_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::AgentNotFound(agent_id.0.to_string()))?;
+        let agent = agent.lock().await;
+
+        if !agent.can_accept_tasks() {
+            return Err(RuntimeError::AgentNotReady(agent_id.0.to_string()));
+        }
+
+        let permissions = agent.permissions.clone();
+        drop(agent);
+        let request: ToolRequest =
+            serde_json::from_value(task.payload.clone()).map_err(|error| {
+                RuntimeError::Execution(format!("invalid tool task payload: {error}"))
+            })?;
+        let result = self.tools.execute(&permissions, request).await?;
+
+        Ok(TaskResult {
+            output: result.output,
+            metadata: serde_json::json!({
+                "tool": result.metadata,
+                "attempts": result.attempts,
+            }),
+        })
+    }
+}
 
 pub struct AgentRuntime {
     scheduler: Scheduler,
     workers: Mutex<Option<WorkerPool>>,
     tasks: Mutex<HashMap<TaskId, SharedTask>>,
-    agents: Mutex<HashMap<AgentId, Arc<Mutex<Agent>>>>,
+    agents: AgentStore,
     tools: ToolExecutor,
+    sandbox: SandboxManager,
+    memory: MemoryManager,
     concurrency: usize,
 }
 
@@ -30,18 +84,35 @@ impl AgentRuntime {
         concurrency: usize,
         tool_config: ToolConfig,
     ) -> Self {
-        let scheduler = Scheduler::new();
+        Self::new_with_memory_manager(executor, concurrency, tool_config, MemoryManager::new())
+    }
 
-        let workers = WorkerPool::new(scheduler.clone(), executor, concurrency);
+    pub fn new_with_memory_manager(
+        executor: Arc<dyn TaskExecutor>,
+        concurrency: usize,
+        tool_config: ToolConfig,
+        memory: MemoryManager,
+    ) -> Self {
+        let scheduler = Scheduler::new();
+        let sandbox = SandboxManager::new(tool_config.sandbox.clone());
         let tools = ToolExecutor::with_defaults(tool_config)
             .expect("default tools must register successfully");
+        let agents = Arc::new(Mutex::new(HashMap::new()));
+        let worker_executor = Arc::new(RuntimeTaskExecutor {
+            generic_executor: executor,
+            agents: agents.clone(),
+            tools: tools.clone(),
+        });
+        let workers = WorkerPool::new(scheduler.clone(), worker_executor, concurrency);
 
         Self {
             scheduler,
             workers: Mutex::new(Some(workers)),
             tasks: Mutex::new(HashMap::new()),
-            agents: Mutex::new(HashMap::new()),
+            agents,
             tools,
+            sandbox,
+            memory,
             concurrency,
         }
     }
@@ -130,11 +201,11 @@ impl AgentRuntime {
         Ok(snapshot)
     }
 
-    pub async fn execute_tool(
+    pub async fn submit_tool_for_agent(
         &self,
         agent_id: AgentId,
         request: ToolRequest,
-    ) -> Result<ToolResult> {
+    ) -> Result<SharedTask> {
         let agent = self.agent_handle(agent_id).await?;
         let agent = agent.lock().await;
 
@@ -142,10 +213,51 @@ impl AgentRuntime {
             return Err(RuntimeError::AgentNotReady(agent_id.0.to_string()));
         }
 
-        let permissions = agent.permissions.clone();
         drop(agent);
+        let task = Task::tool(
+            format!("tool:{}", request.tool),
+            serde_json::to_value(request).expect("tool requests are serializable"),
+        );
 
-        self.tools.execute(&permissions, request).await
+        self.submit_for_agent(agent_id, task).await
+    }
+
+    pub async fn put_agent_memory(
+        &self,
+        agent_id: AgentId,
+        write: MemoryWrite,
+    ) -> Result<MemoryRecord> {
+        self.agent_handle(agent_id).await?;
+        self.memory.put(agent_id, write).await
+    }
+
+    pub async fn get_agent_memory(
+        &self,
+        agent_id: AgentId,
+        scope: MemoryScope,
+        key: &str,
+    ) -> Result<MemoryRecord> {
+        self.agent_handle(agent_id).await?;
+        self.memory
+            .get(agent_id, scope, key)
+            .await?
+            .ok_or_else(|| RuntimeError::MemoryNotFound(key.to_owned()))
+    }
+
+    pub async fn list_agent_memory(&self, agent_id: AgentId) -> Result<Vec<MemoryRecord>> {
+        self.agent_handle(agent_id).await?;
+        self.memory.list(agent_id).await
+    }
+
+    pub async fn search_agent_memory(
+        &self,
+        agent_id: AgentId,
+        query: &str,
+        scope: Option<MemoryScope>,
+        limit: usize,
+    ) -> Result<Vec<SemanticMatch>> {
+        self.agent_handle(agent_id).await?;
+        self.memory.search(agent_id, query, scope, limit).await
     }
 
     pub fn tool_names(&self) -> Vec<String> {
@@ -154,6 +266,10 @@ impl AgentRuntime {
 
     pub fn tool_descriptors(&self) -> Vec<ToolDescriptor> {
         self.tools.registry().descriptors()
+    }
+
+    pub fn sandbox_status(&self) -> SandboxStatus {
+        self.sandbox.status()
     }
 
     pub fn concurrency(&self) -> usize {
@@ -266,13 +382,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agents_execute_tools_through_the_permission_boundary() {
+    async fn tool_tasks_execute_through_workers_and_the_permission_boundary() {
         let executor = Arc::new(MockTaskExecutor::new(Duration::ZERO));
         let runtime = AgentRuntime::new(executor, 1);
         let agent = runtime.create_agent("research-agent").await.unwrap();
 
-        let result = runtime
-            .execute_tool(
+        let task = runtime
+            .submit_tool_for_agent(
                 agent.id,
                 ToolRequest {
                     tool: "echo".into(),
@@ -283,10 +399,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.output, json!({ "ok": true }));
+        let id = task.lock().await.id;
 
-        let denied = runtime
-            .execute_tool(
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let task = runtime.get_task(id).await.unwrap();
+        assert_eq!(task.kind, TaskKind::Tool);
+        assert_eq!(task.result.unwrap().output, json!({ "ok": true }));
+
+        let denied_task = runtime
+            .submit_tool_for_agent(
                 agent.id,
                 ToolRequest {
                     tool: "http_request".into(),
@@ -296,8 +417,44 @@ mod tests {
                 },
             )
             .await
-            .unwrap_err();
-        assert!(matches!(denied, RuntimeError::PermissionDenied(_)));
+            .unwrap();
+        let denied_id = denied_task.lock().await.id;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let denied = runtime.get_task(denied_id).await.unwrap();
+        assert_eq!(denied.status, TaskStatus::Failed);
+        assert!(denied.error.unwrap().contains("Permission denied"));
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn agents_can_manage_scoped_memory() {
+        let executor = Arc::new(MockTaskExecutor::new(Duration::ZERO));
+        let runtime = AgentRuntime::new(executor, 1);
+        let agent = runtime.create_agent("memory-agent").await.unwrap();
+
+        runtime
+            .put_agent_memory(
+                agent.id,
+                MemoryWrite {
+                    key: "current_plan".to_owned(),
+                    value: json!(["research", "report"]),
+                    scope: MemoryScope::Working,
+                    ttl_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .get_agent_memory(agent.id, MemoryScope::Working, "current_plan")
+                .await
+                .unwrap()
+                .value,
+            json!(["research", "report"])
+        );
 
         runtime.shutdown().await;
     }

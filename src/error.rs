@@ -23,6 +23,12 @@ pub enum RuntimeError {
     #[error("Task not found: {0}")]
     TaskNotFound(String),
 
+    #[error("Memory record not found: {0}")]
+    MemoryNotFound(String),
+
+    #[error("Invalid memory key: {0}")]
+    InvalidMemoryKey(String),
+
     #[error("Invalid task state transition: {0}")]
     InvalidStateTransition(String),
 
@@ -34,6 +40,15 @@ pub enum RuntimeError {
 
     #[error("Worker error: {0}")]
     Worker(String),
+
+    #[error("Storage error: {0}")]
+    Storage(#[from] sqlx::Error),
+
+    #[error("Storage migration error: {0}")]
+    StorageMigration(#[from] sqlx::migrate::MigrateError),
+
+    #[error("Memory backend error: {0}")]
+    MemoryBackend(String),
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;

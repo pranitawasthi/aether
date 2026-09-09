@@ -40,17 +40,28 @@ pub enum TaskPriority {
     Critical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    #[default]
+    Generic,
+    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskResult {
     pub output: serde_json::Value,
     pub metadata: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
 
     pub agent_id: Option<AgentId>,
+
+    #[serde(default)]
+    pub kind: TaskKind,
 
     pub name: String,
 
@@ -80,6 +91,7 @@ impl Task {
         Self {
             id: TaskId::new(),
             agent_id: None,
+            kind: TaskKind::Generic,
             name: name.into(),
             payload,
             status: TaskStatus::Created,
@@ -94,6 +106,12 @@ impl Task {
     pub fn for_agent(mut self, agent_id: AgentId) -> Self {
         self.agent_id = Some(agent_id);
         self
+    }
+
+    pub fn tool(name: impl Into<String>, request: serde_json::Value) -> Self {
+        let mut task = Self::new(name, request, TaskPriority::Normal);
+        task.kind = TaskKind::Tool;
+        task
     }
 
     pub fn queue(&mut self) -> Result<()> {

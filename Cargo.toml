@@ -28,6 +28,8 @@ thiserror = "2"
 
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "migrate", "macros"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

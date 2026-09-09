@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, path::PathBuf, time::Duration};
 
 use crate::error::{Result, RuntimeError};
+use crate::sandbox::{SandboxConfig, SandboxManager};
 
 use super::{
     echo::EchoTool, file_read::FileReadTool, http::HttpRequestTool, python::PythonTool,
@@ -17,6 +18,8 @@ pub struct ToolConfig {
     pub python_program: String,
     pub max_process_output_bytes: usize,
     pub max_timeout_ms: u64,
+    pub enable_host_process_tools: bool,
+    pub sandbox: SandboxConfig,
 }
 
 impl Default for ToolConfig {
@@ -30,6 +33,8 @@ impl Default for ToolConfig {
             python_program: "python3".to_owned(),
             max_process_output_bytes: 1_048_576,
             max_timeout_ms: 60_000,
+            enable_host_process_tools: false,
+            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -54,16 +59,23 @@ impl ToolExecutor {
             config.allowed_http_hosts,
             config.max_http_response_bytes,
         )?))?;
-        registry.register(std::sync::Arc::new(ShellTool::new(
-            config.file_root.clone(),
-            config.allowed_shell_programs,
-            config.max_process_output_bytes,
-        )))?;
-        registry.register(std::sync::Arc::new(PythonTool::new(
-            config.file_root,
-            config.python_program,
-            config.max_process_output_bytes,
-        )))?;
+        if config.enable_host_process_tools {
+            registry.register(std::sync::Arc::new(ShellTool::new(
+                config.file_root.clone(),
+                config.allowed_shell_programs,
+                config.max_process_output_bytes,
+            )))?;
+            registry.register(std::sync::Arc::new(PythonTool::new(
+                config.file_root.clone(),
+                config.python_program,
+                config.max_process_output_bytes,
+            )))?;
+        }
+        if let Some(tool) = SandboxManager::new(config.sandbox.clone())
+            .docker_tool(config.file_root.clone(), config.max_process_output_bytes)
+        {
+            registry.register(std::sync::Arc::new(tool))?;
+        }
 
         Ok(Self {
             registry,

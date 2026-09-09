@@ -3,7 +3,7 @@ mod executor;
 mod file_read;
 mod http;
 mod permissions;
-mod process;
+pub(crate) mod process;
 mod python;
 mod registry;
 mod shell;
@@ -154,8 +154,8 @@ mod tests {
         assert!(names.contains(&"file.read".to_owned()));
         assert!(names.contains(&"http_request".to_owned()));
         assert!(names.contains(&"http.get".to_owned()));
-        assert!(names.contains(&"shell".to_owned()));
-        assert!(names.contains(&"python".to_owned()));
+        assert!(!names.contains(&"shell".to_owned()));
+        assert!(!names.contains(&"python".to_owned()));
 
         let result = executor
             .execute(
