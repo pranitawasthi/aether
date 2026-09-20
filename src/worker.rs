@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     error::{Result, RuntimeError},
+    event::{EventBus, RuntimeEventKind},
     scheduler::Scheduler,
     task::{Task, TaskResult, TaskStatus},
 };
@@ -106,7 +107,12 @@ pub struct WorkerPool {
 }
 
 impl WorkerPool {
-    pub fn new(scheduler: Scheduler, executor: Arc<dyn TaskExecutor>, concurrency: usize) -> Self {
+    pub fn new(
+        scheduler: Scheduler,
+        executor: Arc<dyn TaskExecutor>,
+        events: EventBus,
+        concurrency: usize,
+    ) -> Self {
         assert!(
             concurrency > 0,
             "Worker concurrency must be greater than zero"
@@ -117,9 +123,10 @@ impl WorkerPool {
         for worker_id in 0..concurrency {
             let scheduler = scheduler.clone();
             let executor = executor.clone();
+            let events = events.clone();
 
             let handle = tokio::spawn(async move {
-                worker_loop(worker_id, scheduler, executor).await;
+                worker_loop(worker_id, scheduler, executor, events).await;
             });
 
             workers.push(handle);
@@ -147,7 +154,12 @@ impl WorkerPool {
     }
 }
 
-async fn worker_loop(worker_id: usize, scheduler: Scheduler, executor: Arc<dyn TaskExecutor>) {
+async fn worker_loop(
+    worker_id: usize,
+    scheduler: Scheduler,
+    executor: Arc<dyn TaskExecutor>,
+    events: EventBus,
+) {
     tracing::info!(worker_id, "Worker started");
 
     while let Some(task) = scheduler.next_task().await {
@@ -165,7 +177,9 @@ async fn worker_loop(worker_id: usize, scheduler: Scheduler, executor: Arc<dyn T
                 continue;
             }
 
-            task_guard.clone()
+            let snapshot = task_guard.clone();
+            events.publish_task(RuntimeEventKind::TaskStarted, &snapshot);
+            snapshot
         };
 
         tracing::info!(
@@ -193,6 +207,7 @@ async fn worker_loop(worker_id: usize, scheduler: Scheduler, executor: Arc<dyn T
                 if let Err(error) = task_guard.complete(result) {
                     tracing::error!(worker_id, ?error, "Failed to complete task");
                 } else {
+                    events.publish_task(RuntimeEventKind::TaskCompleted, &task_guard);
                     tracing::info!(
                         worker_id,
                         task_id = %task_guard.id.0,
@@ -207,6 +222,7 @@ async fn worker_loop(worker_id: usize, scheduler: Scheduler, executor: Arc<dyn T
                 if let Err(state_error) = task_guard.fail(message.clone()) {
                     tracing::error!(worker_id, ?state_error, "Failed to mark task as failed");
                 } else {
+                    events.publish_task(RuntimeEventKind::TaskFailed, &task_guard);
                     tracing::warn!(
                         worker_id,
                         task_id = %task_guard.id.0,

@@ -13,7 +13,9 @@ use uuid::Uuid;
 use crate::{
     agent::{Agent, AgentId},
     error::RuntimeError,
+    event::RuntimeEvent,
     memory::{MemoryRecord, MemoryScope, MemoryWrite, SemanticMatch},
+    message::AgentMessage,
     runtime::AgentRuntime,
     sandbox::SandboxStatus,
     task::{Task, TaskId, TaskPriority},
@@ -40,12 +42,20 @@ pub struct CreateAgentRequest {
     pub permissions: PermissionSet,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SendAgentMessageRequest {
+    pub to_agent_id: AgentId,
+    pub topic: String,
+    pub payload: serde_json::Value,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RuntimeStatus {
     pub concurrency: usize,
     pub queued_tasks: usize,
     pub tracked_tasks: usize,
     pub tracked_agents: usize,
+    pub durable_workers: usize,
     pub sandbox: SandboxStatus,
 }
 
@@ -63,8 +73,28 @@ struct MemorySearchQuery {
     limit: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct EventQuery {
+    #[serde(default = "default_event_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct InboxQuery {
+    #[serde(default = "default_inbox_limit")]
+    limit: usize,
+}
+
 fn default_memory_search_limit() -> usize {
     10
+}
+
+fn default_event_limit() -> usize {
+    100
+}
+
+fn default_inbox_limit() -> usize {
+    100
 }
 
 pub fn router(runtime: Arc<AgentRuntime>) -> Router {
@@ -79,10 +109,15 @@ pub fn router(runtime: Arc<AgentRuntime>) -> Router {
         .route("/agents/{id}/memory/{key}", get(get_agent_memory))
         .route("/agents/{id}/tasks", post(submit_agent_task))
         .route("/agents/{id}/tools", post(execute_tool))
+        .route(
+            "/agents/{id}/messages",
+            get(list_agent_messages).post(send_agent_message),
+        )
         .route("/tasks", post(submit_task))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/runtime/status", get(runtime_status))
+        .route("/runtime/events", get(list_runtime_events))
         .route("/tools", get(list_tools))
         .with_state(Arc::new(ApiState { runtime }))
 }
@@ -189,6 +224,37 @@ async fn execute_tool(
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
+async fn send_agent_message(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<SendAgentMessageRequest>,
+) -> Result<(StatusCode, Json<AgentMessage>), ApiError> {
+    validate_name(&request.topic, "Message topic")?;
+    let message = state
+        .runtime
+        .send_agent_message(
+            parse_agent_id(&id)?,
+            request.to_agent_id,
+            request.topic,
+            request.payload,
+        )
+        .await?;
+
+    Ok((StatusCode::ACCEPTED, Json(message)))
+}
+
+async fn list_agent_messages(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<InboxQuery>,
+) -> Result<Json<Vec<AgentMessage>>, ApiError> {
+    let messages = state
+        .runtime
+        .agent_inbox(parse_agent_id(&id)?, query.limit.min(1_000))
+        .await?;
+    Ok(Json(messages))
+}
+
 async fn list_tools(State(state): State<Arc<ApiState>>) -> Json<Vec<ToolDescriptor>> {
     Json(state.runtime.tool_descriptors())
 }
@@ -235,8 +301,16 @@ async fn runtime_status(State(state): State<Arc<ApiState>>) -> Json<RuntimeStatu
         queued_tasks: state.runtime.queue_len().await,
         tracked_tasks: state.runtime.task_count().await,
         tracked_agents: state.runtime.agent_count().await,
+        durable_workers: state.runtime.active_durable_worker_count().await,
         sandbox: state.runtime.sandbox_status(),
     })
+}
+
+async fn list_runtime_events(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<EventQuery>,
+) -> Json<Vec<RuntimeEvent>> {
+    Json(state.runtime.recent_events(query.limit.min(1_024)))
 }
 
 fn parse_agent_id(value: &str) -> Result<AgentId, ApiError> {
@@ -284,6 +358,7 @@ impl From<RuntimeError> for ApiError {
             RuntimeError::AgentNotReady(_) | RuntimeError::InvalidStateTransition(_) => {
                 StatusCode::CONFLICT
             }
+            RuntimeError::LeaseLost(_) => StatusCode::CONFLICT,
             RuntimeError::SchedulerShutdown => StatusCode::SERVICE_UNAVAILABLE,
             RuntimeError::ToolTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             RuntimeError::ToolAlreadyRegistered(_) => StatusCode::CONFLICT,
@@ -467,6 +542,114 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runtime_events_endpoint_lists_agent_lifecycle_events() {
+        let executor = Arc::new(MockTaskExecutor::new(Duration::ZERO));
+        let runtime = Arc::new(AgentRuntime::new(executor, 1));
+        let app = router(runtime.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"event-agent"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime/events?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let events: Vec<RuntimeEvent> =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, crate::event::RuntimeEventKind::AgentCreated);
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn agents_can_send_and_receive_messages_over_the_api() {
+        let executor = Arc::new(MockTaskExecutor::new(Duration::ZERO));
+        let runtime = Arc::new(AgentRuntime::new(executor, 1));
+        let app = router(runtime.clone());
+
+        let create_agent = |name: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/agents")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"name":"{name}"}}"#)))
+                .unwrap()
+        };
+        let sender_response = app.clone().oneshot(create_agent("sender")).await.unwrap();
+        let sender: Agent = serde_json::from_slice(
+            &to_bytes(sender_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let recipient_response = app
+            .clone()
+            .oneshot(create_agent("recipient"))
+            .await
+            .unwrap();
+        let recipient: Agent = serde_json::from_slice(
+            &to_bytes(recipient_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/agents/{}/messages", sender.id.0))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"to_agent_id":"{}","topic":"handoff","payload":{{"task":"review"}}}}"#,
+                        recipient.id.0
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/agents/{}/messages", recipient.id.0))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let messages: Vec<AgentMessage> =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from_agent_id, sender.id);
+        assert_eq!(messages[0].topic, "handoff");
+
         runtime.shutdown().await;
     }
 

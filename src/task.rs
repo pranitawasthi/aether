@@ -138,6 +138,21 @@ impl Task {
         self.transition(TaskStatus::Cancelled)
     }
 
+    pub fn requeue_after_lease_expiry(&mut self) -> Result<()> {
+        if self.status != TaskStatus::Running {
+            return Err(RuntimeError::InvalidStateTransition(format!(
+                "Only running tasks can be recovered after a lease expiry; found {:?}",
+                self.status
+            )));
+        }
+
+        self.status = TaskStatus::Queued;
+        self.result = None;
+        self.error = None;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
     fn transition(&mut self, next: TaskStatus) -> Result<()> {
         if !self.is_valid_transition(next) {
             return Err(RuntimeError::InvalidStateTransition(format!(
@@ -211,5 +226,15 @@ mod tests {
 
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(task.error.as_deref(), Some("something went wrong"));
+    }
+
+    #[test]
+    fn running_task_can_be_requeued_after_a_worker_lease_expires() {
+        let mut task = Task::new("recover", json!({}), TaskPriority::Normal);
+        task.queue().unwrap();
+        task.start().unwrap();
+        task.requeue_after_lease_expiry().unwrap();
+
+        assert_eq!(task.status, TaskStatus::Queued);
     }
 }

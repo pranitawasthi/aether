@@ -1,7 +1,10 @@
 pub mod agent;
 pub mod api;
+pub mod distributed;
 pub mod error;
+pub mod event;
 pub mod memory;
+pub mod message;
 pub mod runtime;
 pub mod sandbox;
 pub mod scheduler;

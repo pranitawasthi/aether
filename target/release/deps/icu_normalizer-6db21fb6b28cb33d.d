@@ -1,0 +1,10 @@
+/Users/pranitawasthi/Desktop/agent-runtime/target/release/deps/icu_normalizer-6db21fb6b28cb33d.d: /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/lib.rs /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/properties.rs /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/provider.rs /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/uts46.rs
+
+/Users/pranitawasthi/Desktop/agent-runtime/target/release/deps/libicu_normalizer-6db21fb6b28cb33d.rlib: /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/lib.rs /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/properties.rs /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/provider.rs /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/uts46.rs
+
+/Users/pranitawasthi/Desktop/agent-runtime/target/release/deps/libicu_normalizer-6db21fb6b28cb33d.rmeta: /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/lib.rs /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/properties.rs /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/provider.rs /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/uts46.rs
+
+/Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/lib.rs:
+/Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/properties.rs:
+/Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/provider.rs:
+/Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_normalizer-2.3.0/src/uts46.rs:

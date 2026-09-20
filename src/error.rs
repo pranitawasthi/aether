@@ -49,6 +49,9 @@ pub enum RuntimeError {
 
     #[error("Memory backend error: {0}")]
     MemoryBackend(String),
+
+    #[error("Task lease was lost: {0}")]
+    LeaseLost(String),
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;

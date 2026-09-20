@@ -6,9 +6,12 @@ use tokio::sync::Mutex;
 use crate::{
     agent::{Agent, AgentId},
     error::{Result, RuntimeError},
+    event::{EventBus, RuntimeEvent, RuntimeEventKind},
     memory::{MemoryManager, MemoryRecord, MemoryScope, MemoryWrite, SemanticMatch},
+    message::{AgentMessage, MessageRouter},
     sandbox::{SandboxManager, SandboxStatus},
     scheduler::{Scheduler, SharedTask},
+    storage::{PostgresStorage, TaskStorage},
     task::{Task, TaskId, TaskKind, TaskResult},
     tool::{PermissionSet, ToolConfig, ToolDescriptor, ToolExecutor, ToolRequest},
     worker::{TaskExecutor, WorkerPool},
@@ -71,6 +74,9 @@ pub struct AgentRuntime {
     tools: ToolExecutor,
     sandbox: SandboxManager,
     memory: MemoryManager,
+    durable_storage: Option<PostgresStorage>,
+    messages: MessageRouter,
+    events: EventBus,
     concurrency: usize,
 }
 
@@ -93,35 +99,63 @@ impl AgentRuntime {
         tool_config: ToolConfig,
         memory: MemoryManager,
     ) -> Self {
+        Self::new_with_memory_and_storage(executor, concurrency, tool_config, memory, None)
+    }
+
+    pub fn new_with_memory_and_storage(
+        executor: Arc<dyn TaskExecutor>,
+        concurrency: usize,
+        tool_config: ToolConfig,
+        memory: MemoryManager,
+        durable_storage: Option<PostgresStorage>,
+    ) -> Self {
         let scheduler = Scheduler::new();
         let sandbox = SandboxManager::new(tool_config.sandbox.clone());
         let tools = ToolExecutor::with_defaults(tool_config)
             .expect("default tools must register successfully");
         let agents = Arc::new(Mutex::new(HashMap::new()));
-        let worker_executor = Arc::new(RuntimeTaskExecutor {
-            generic_executor: executor,
-            agents: agents.clone(),
-            tools: tools.clone(),
+        let events = EventBus::new();
+        let workers = durable_storage.is_none().then(|| {
+            let worker_executor = Arc::new(RuntimeTaskExecutor {
+                generic_executor: executor,
+                agents: agents.clone(),
+                tools: tools.clone(),
+            });
+            WorkerPool::new(
+                scheduler.clone(),
+                worker_executor,
+                events.clone(),
+                concurrency,
+            )
         });
-        let workers = WorkerPool::new(scheduler.clone(), worker_executor, concurrency);
 
         Self {
             scheduler,
-            workers: Mutex::new(Some(workers)),
+            workers: Mutex::new(workers),
             tasks: Mutex::new(HashMap::new()),
             agents,
             tools,
             sandbox,
             memory,
+            durable_storage,
+            messages: MessageRouter::new(),
+            events,
             concurrency,
         }
     }
 
     pub async fn submit(&self, task: Task) -> Result<SharedTask> {
-        let task = self.scheduler.submit(task).await?;
-        let id = task.lock().await.id;
+        let task = if let Some(storage) = &self.durable_storage {
+            Arc::new(Mutex::new(storage.enqueue(task).await?))
+        } else {
+            self.scheduler.submit(task).await?
+        };
+        let snapshot = task.lock().await.clone();
+        let id = snapshot.id;
 
         self.tasks.lock().await.insert(id, task.clone());
+        self.events
+            .publish_task(RuntimeEventKind::TaskQueued, &snapshot);
 
         Ok(task)
     }
@@ -139,13 +173,19 @@ impl AgentRuntime {
     }
 
     pub async fn get_task(&self, id: TaskId) -> Result<Task> {
-        let task = self
-            .tasks
-            .lock()
-            .await
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| RuntimeError::TaskNotFound(id.0.to_string()))?;
+        if let Some(storage) = &self.durable_storage {
+            let task = storage
+                .get_task(id)
+                .await?
+                .ok_or_else(|| RuntimeError::TaskNotFound(id.0.to_string()))?;
+            self.tasks
+                .lock()
+                .await
+                .insert(id, Arc::new(Mutex::new(task.clone())));
+            return Ok(task);
+        }
+
+        let task = self.task_handle(id).await?;
 
         let snapshot = task.lock().await.clone();
 
@@ -153,13 +193,21 @@ impl AgentRuntime {
     }
 
     pub async fn cancel_task(&self, id: TaskId) -> Result<Task> {
-        let task = self
-            .tasks
-            .lock()
-            .await
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| RuntimeError::TaskNotFound(id.0.to_string()))?;
+        if let Some(storage) = &self.durable_storage {
+            let task = storage
+                .cancel(id)
+                .await?
+                .ok_or_else(|| RuntimeError::TaskNotFound(id.0.to_string()))?;
+            self.tasks
+                .lock()
+                .await
+                .insert(id, Arc::new(Mutex::new(task.clone())));
+            self.events
+                .publish_task(RuntimeEventKind::TaskCancelled, &task);
+            return Ok(task);
+        }
+
+        let task = self.task_handle(id).await?;
 
         let mut task = task.lock().await;
         task.cancel()?;
@@ -167,6 +215,8 @@ impl AgentRuntime {
         drop(task);
 
         self.scheduler.cancel(id).await;
+        self.events
+            .publish_task(RuntimeEventKind::TaskCancelled, &snapshot);
 
         Ok(snapshot)
     }
@@ -186,10 +236,20 @@ impl AgentRuntime {
         agent.ready()?;
         let snapshot = agent.clone();
 
+        if let Some(storage) = &self.durable_storage {
+            storage.create_agent(&snapshot).await?;
+        }
+
         self.agents
             .lock()
             .await
             .insert(agent.id, Arc::new(Mutex::new(agent)));
+        self.events.publish(
+            RuntimeEventKind::AgentCreated,
+            Some(snapshot.id),
+            None,
+            serde_json::json!({ "agent": snapshot }),
+        );
 
         Ok(snapshot)
     }
@@ -228,7 +288,9 @@ impl AgentRuntime {
         write: MemoryWrite,
     ) -> Result<MemoryRecord> {
         self.agent_handle(agent_id).await?;
-        self.memory.put(agent_id, write).await
+        let record = self.memory.put(agent_id, write).await?;
+        self.events.publish_memory(&record);
+        Ok(record)
     }
 
     pub async fn get_agent_memory(
@@ -260,6 +322,39 @@ impl AgentRuntime {
         self.memory.search(agent_id, query, scope, limit).await
     }
 
+    pub async fn send_agent_message(
+        &self,
+        from_agent_id: AgentId,
+        to_agent_id: AgentId,
+        topic: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Result<AgentMessage> {
+        self.agent_handle(from_agent_id).await?;
+        self.agent_handle(to_agent_id).await?;
+
+        let topic = topic.into();
+        if topic.trim().is_empty() {
+            return Err(RuntimeError::Execution(
+                "Message topic must not be empty".to_owned(),
+            ));
+        }
+
+        let message = AgentMessage::new(from_agent_id, to_agent_id, topic, payload);
+        self.messages.deliver(message.clone()).await;
+        self.events.publish(
+            RuntimeEventKind::MessageSent,
+            Some(from_agent_id),
+            None,
+            serde_json::json!({ "message": message }),
+        );
+        Ok(message)
+    }
+
+    pub async fn agent_inbox(&self, agent_id: AgentId, limit: usize) -> Result<Vec<AgentMessage>> {
+        self.agent_handle(agent_id).await?;
+        Ok(self.messages.inbox(agent_id, limit).await)
+    }
+
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.registry().names()
     }
@@ -272,11 +367,22 @@ impl AgentRuntime {
         self.sandbox.status()
     }
 
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<RuntimeEvent> {
+        self.events.subscribe()
+    }
+
+    pub fn recent_events(&self, limit: usize) -> Vec<RuntimeEvent> {
+        self.events.recent(limit)
+    }
+
     pub fn concurrency(&self) -> usize {
         self.concurrency
     }
 
     pub async fn queue_len(&self) -> usize {
+        if let Some(storage) = &self.durable_storage {
+            return storage.queue_len().await.unwrap_or(0);
+        }
         self.scheduler.queue_len().await
     }
 
@@ -288,6 +394,16 @@ impl AgentRuntime {
         self.agents.lock().await.len()
     }
 
+    pub async fn active_durable_worker_count(&self) -> usize {
+        let Some(storage) = &self.durable_storage else {
+            return 0;
+        };
+        storage
+            .active_worker_count(chrono::Duration::seconds(90))
+            .await
+            .unwrap_or(0)
+    }
+
     pub async fn shutdown(&self) {
         if let Some(workers) = self.workers.lock().await.take() {
             workers.shutdown().await;
@@ -295,12 +411,39 @@ impl AgentRuntime {
     }
 
     async fn agent_handle(&self, id: AgentId) -> Result<Arc<Mutex<Agent>>> {
-        self.agents
-            .lock()
-            .await
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| RuntimeError::AgentNotFound(id.0.to_string()))
+        if let Some(agent) = self.agents.lock().await.get(&id).cloned() {
+            return Ok(agent);
+        }
+
+        let storage = self
+            .durable_storage
+            .as_ref()
+            .ok_or_else(|| RuntimeError::AgentNotFound(id.0.to_string()))?;
+        let agent = storage
+            .get_agent(id)
+            .await?
+            .ok_or_else(|| RuntimeError::AgentNotFound(id.0.to_string()))?;
+        let agent = Arc::new(Mutex::new(agent));
+        self.agents.lock().await.insert(id, agent.clone());
+        Ok(agent)
+    }
+
+    async fn task_handle(&self, id: TaskId) -> Result<SharedTask> {
+        if let Some(task) = self.tasks.lock().await.get(&id).cloned() {
+            return Ok(task);
+        }
+
+        let storage = self
+            .durable_storage
+            .as_ref()
+            .ok_or_else(|| RuntimeError::TaskNotFound(id.0.to_string()))?;
+        let task = storage
+            .get_task(id)
+            .await?
+            .ok_or_else(|| RuntimeError::TaskNotFound(id.0.to_string()))?;
+        let task = Arc::new(Mutex::new(task));
+        self.tasks.lock().await.insert(id, task.clone());
+        Ok(task)
     }
 }
 
@@ -455,6 +598,48 @@ mod tests {
                 .value,
             json!(["research", "report"])
         );
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runtime_emits_events_for_agent_task_and_memory_changes() {
+        let executor = Arc::new(MockTaskExecutor::new(Duration::ZERO));
+        let runtime = AgentRuntime::new(executor, 1);
+        let agent = runtime.create_agent("event-agent").await.unwrap();
+
+        runtime
+            .put_agent_memory(
+                agent.id,
+                MemoryWrite {
+                    key: "goal".to_owned(),
+                    value: json!("publish events"),
+                    scope: MemoryScope::Working,
+                    ttl_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .submit_for_agent(
+                agent.id,
+                Task::new("event-task", json!({}), TaskPriority::Normal),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let kinds = runtime
+            .recent_events(10)
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+
+        assert!(kinds.contains(&RuntimeEventKind::AgentCreated));
+        assert!(kinds.contains(&RuntimeEventKind::MemoryUpdated));
+        assert!(kinds.contains(&RuntimeEventKind::TaskQueued));
+        assert!(kinds.contains(&RuntimeEventKind::TaskStarted));
+        assert!(kinds.contains(&RuntimeEventKind::TaskCompleted));
 
         runtime.shutdown().await;
     }

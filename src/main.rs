@@ -2,24 +2,35 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_runtime::{
     api,
+    distributed::{DistributedWorker, DistributedWorkerConfig, DurableTaskExecutor},
     memory::{MemoryConfig, MemoryManager},
     runtime::AgentRuntime,
     sandbox::SandboxConfig,
-    tool::ToolConfig,
+    storage::PostgresStorage,
+    tool::{ToolConfig, ToolExecutor},
     worker::MockTaskExecutor,
 };
+use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let executor = Arc::new(MockTaskExecutor::new(Duration::from_secs(1)));
+    let tool_config = tool_config_from_env();
+
+    if let Ok(worker_id) = std::env::var("AGENT_RUNTIME_WORKER_ID") {
+        return run_distributed_worker(worker_id, executor, tool_config).await;
+    }
+
     let memory = MemoryManager::from_config(memory_config_from_env()).await?;
-    let runtime = Arc::new(AgentRuntime::new_with_memory_manager(
+    let durable_storage = durable_storage_from_env().await?;
+    let runtime = Arc::new(AgentRuntime::new_with_memory_and_storage(
         executor,
         3,
-        tool_config_from_env(),
+        tool_config,
         memory,
+        durable_storage,
     ));
     let app = api::router(runtime.clone());
     let address =
@@ -36,6 +47,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn run_distributed_worker(
+    worker_id: String,
+    generic_executor: Arc<MockTaskExecutor>,
+    tool_config: ToolConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("AGENT_RUNTIME_DATABASE_URL")?;
+    let max_connections = std::env::var("AGENT_RUNTIME_DATABASE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5);
+    let storage = PostgresStorage::connect(&database_url, max_connections).await?;
+    storage.migrate().await?;
+    let tools = ToolExecutor::with_defaults(tool_config)?;
+    let executor = Arc::new(DurableTaskExecutor::new(
+        generic_executor,
+        storage.clone(),
+        tools,
+    ));
+    let worker =
+        DistributedWorker::new(storage, executor, DistributedWorkerConfig::new(worker_id))?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let worker_handle = tokio::spawn(async move { worker.run_until_shutdown(shutdown_rx).await });
+
+    shutdown_signal().await;
+    let _ = shutdown_tx.send(true);
+    worker_handle.await??;
+    Ok(())
+}
+
 fn memory_config_from_env() -> MemoryConfig {
     MemoryConfig {
         redis_url: std::env::var("AGENT_RUNTIME_REDIS_URL").ok(),
@@ -45,6 +85,23 @@ fn memory_config_from_env() -> MemoryConfig {
             .and_then(|value| value.parse().ok())
             .unwrap_or(5),
     }
+}
+
+async fn durable_storage_from_env() -> Result<Option<PostgresStorage>, Box<dyn std::error::Error>> {
+    let enabled = std::env::var("AGENT_RUNTIME_DURABLE_QUEUE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"));
+    if !enabled {
+        return Ok(None);
+    }
+
+    let database_url = std::env::var("AGENT_RUNTIME_DATABASE_URL")?;
+    let max_connections = std::env::var("AGENT_RUNTIME_DATABASE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5);
+    let storage = PostgresStorage::connect(&database_url, max_connections).await?;
+    storage.migrate().await?;
+    Ok(Some(storage))
 }
 
 fn tool_config_from_env() -> ToolConfig {

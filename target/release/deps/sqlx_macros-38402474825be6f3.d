@@ -1,0 +1,5 @@
+/Users/pranitawasthi/Desktop/agent-runtime/target/release/deps/sqlx_macros-38402474825be6f3.d: /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-macros-0.8.6/src/lib.rs
+
+/Users/pranitawasthi/Desktop/agent-runtime/target/release/deps/libsqlx_macros-38402474825be6f3.dylib: /Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-macros-0.8.6/src/lib.rs
+
+/Users/pranitawasthi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sqlx-macros-0.8.6/src/lib.rs:

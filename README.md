@@ -18,6 +18,18 @@ default keeps both scopes in memory for local development.
 Phase 4 also includes an opt-in PostgreSQL task-storage adapter and migration. The in-memory scheduler
 remains the default execution backend until durable runtime wiring and crash recovery are added.
 
+Phase 5 adds an in-process event bus. It emits typed events for agent creation, task queueing and
+completion/failure/cancellation, and memory writes. Events are delivered live to runtime subscribers and
+kept in a bounded in-memory history for API clients. Durable broker delivery is a later distributed phase.
+
+Phase 6 adds direct, bounded messages between registered agents. A message is explicitly addressed and
+stored only in the recipient's in-memory inbox; sending a message never grants tool permissions or starts
+work in the recipient agent.
+
+Phase 7 has begun with a PostgreSQL durable task queue. Its claim/lease protocol lets independent worker
+processes atomically claim work, renew a lease, and acknowledge completion with an unguessable lease token.
+Set the durable-queue flag on the API process and run one or more separate worker processes to enable it.
+
 ## Run
 
 ```sh
@@ -38,10 +50,13 @@ The API listens on `127.0.0.1:3000` by default. Set `AGENT_RUNTIME_ADDR` to bind
 | `GET` | `/agents/{id}/memory/search?q=cloud&limit=10` | Semantically retrieve matching memory records. |
 | `POST` | `/agents/{id}/tasks` | Submit an asynchronous task for an agent. |
 | `POST` | `/agents/{id}/tools` | Queue a permission-checked tool task for an agent. |
+| `POST` | `/agents/{id}/messages` | Send a message from this agent to another registered agent. |
+| `GET` | `/agents/{id}/messages?limit=100` | List the agent's most recent inbox messages. |
 | `POST` | `/tasks` | Submit an unowned asynchronous task. |
 | `GET` | `/tasks/{id}` | Retrieve the latest task state and result. |
 | `POST` | `/tasks/{id}/cancel` | Cancel a queued or running task. |
 | `GET` | `/runtime/status` | Retrieve queue, task, agent, and worker counts. |
+| `GET` | `/runtime/events?limit=100` | List the most recent runtime events. |
 | `GET` | `/tools` | List registered tools and required capabilities. |
 
 Example:
@@ -114,3 +129,57 @@ curl -X POST http://127.0.0.1:3000/agents/{agent_id}/memory \
 `PostgresStorage` is an SDK-facing adapter. Create it with `PostgresStorage::connect`, call `migrate`,
 then use the `TaskStorage` trait for task CRUD. It serializes each runtime task as JSONB while preserving
 UUID and timestamp columns for indexing. The initial migration is in `migrations/0001_create_tasks.sql`.
+
+For Phase 7, the same adapter exposes `enqueue`, `claim_next`, `renew_lease`, and `acknowledge`. Claiming
+uses PostgreSQL row locking with `SKIP LOCKED`, so concurrent workers cannot receive the same available
+task. A lease includes a worker ID, expiry, and random token; renewals and acknowledgements must match that
+token and fail safely if the lease has expired or been reclaimed. An expired running task is returned to the
+queued state before a new worker receives it. The queue schema is in
+`migrations/0003_create_task_leases.sql`.
+
+`DistributedWorker` is the lease-aware SDK worker loop for this queue. It marks a claimed task as running,
+renews the lease at half its configured duration while its executor runs, and acknowledges only a terminal
+task snapshot. The loop can be stopped with a Tokio `watch` signal.
+
+Enable the API's durable mode with a PostgreSQL URL. It persists agents (including their permissions) and
+enqueues tasks without starting a local worker pool. Start a separate process for each durable worker; it
+re-loads an agent's persisted permissions before executing a tool task. Local scheduling remains the default
+when `AGENT_RUNTIME_DURABLE_QUEUE` is absent.
+
+```sh
+# API / control-plane process
+AGENT_RUNTIME_DURABLE_QUEUE=true \
+AGENT_RUNTIME_DATABASE_URL="postgres://user:password@127.0.0.1:5432/agent_runtime" \
+cargo run
+
+# One worker process (run in another terminal; repeat to scale out)
+AGENT_RUNTIME_WORKER_ID="worker-1" \
+AGENT_RUNTIME_DATABASE_URL="postgres://user:password@127.0.0.1:5432/agent_runtime" \
+cargo run
+```
+
+Do not set `AGENT_RUNTIME_DURABLE_QUEUE` on worker processes. The worker-mode selector is
+`AGENT_RUNTIME_WORKER_ID`; that mode does not bind the HTTP listener.
+
+Each worker registers a heartbeat in PostgreSQL on startup, while idle, and after each task. In durable
+mode, `GET /runtime/status` exposes `durable_workers`, counting heartbeats seen within the last 90 seconds.
+
+## Phase 5 event bus
+
+`EventBus` is exposed through `AgentRuntime::subscribe_events()` for in-process consumers. Its typed
+events have a monotonic ID, timestamp, event kind, optional agent/task IDs, and a JSON snapshot payload.
+The `GET /runtime/events` endpoint returns the retained history in chronological order; the default limit
+is 100 and the maximum is 1,024. The history is intentionally process-local and bounded, so it is useful
+for control-plane clients and diagnostics but is not a replacement for a durable broker.
+
+## Phase 6 multi-agent messaging
+
+Send a message by addressing the sender's messages endpoint. The recipient must already exist, and can
+read only its own inbox. Each inbox retains its most recent 1,000 messages, in chronological order. A
+successful delivery also emits a `message_sent` runtime event.
+
+```sh
+curl -X POST http://127.0.0.1:3000/agents/{sender_id}/messages \
+  -H 'content-type: application/json' \
+  -d '{"to_agent_id":"{recipient_id}","topic":"handoff","payload":{"task":"review"}}'
+```
