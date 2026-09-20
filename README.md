@@ -1,112 +1,192 @@
 # Agent Infrastructure Runtime
 
-Phase 1 provides an in-memory Rust runtime for asynchronously executing tasks. It includes managed
-agents, priority scheduling, a bounded Tokio worker pool, task lifecycle tracking, cancellation, and a
-REST API.
+Agent Infrastructure Runtime is a small Rust control plane for running agent work safely and
+observably. It gives you the pieces most agent applications need before they become production
+systems: agents with explicit permissions, queued tasks, tool execution, sandboxed process execution,
+memory, runtime events, direct agent messages, and optional distributed workers backed by PostgreSQL.
 
-Phase 2 adds the tool system from the runtime spec: `ToolRegistry`, `ToolExecutor`, capability
-permissions, timeouts, retries, and scheduled tool tasks. Registered tools are `echo`, `file_read`, and
-`http_request`. Sandboxing, messaging, persistence, and distributed workers remain later roadmap work.
+The project is intentionally usable in two modes:
 
-Phase 3 now has a fail-closed Docker sandbox backend. It is disabled unless a runtime-controlled image
-is configured, and it never falls back to host-process execution.
+- Local mode: one `cargo run` starts the API, in-memory scheduler, and worker pool. This is the
+  default and is best for development.
+- Durable mode: the API persists agents and queues tasks in PostgreSQL, while separate worker
+  processes claim and execute tasks with lease tokens. This is the mode to use when you want crash
+  recovery or multiple workers.
 
-Phase 4 provides a runtime-owned memory interface with configurable backends: Redis for working memory,
-PostgreSQL for persistent memory, and deterministic vector-style semantic retrieval. The zero-config
-default keeps both scopes in memory for local development.
+Attached specs and design documents describe the product direction, but this README is the operating
+guide for the code in this repository.
 
-Phase 4 also includes an opt-in PostgreSQL task-storage adapter and migration. The in-memory scheduler
-remains the default execution backend until durable runtime wiring and crash recovery are added.
+## What It Does
 
-Phase 5 adds an in-process event bus. It emits typed events for agent creation, task queueing and
-completion/failure/cancellation, and memory writes. Events are delivered live to runtime subscribers and
-kept in a bounded in-memory history for API clients. Durable broker delivery is a later distributed phase.
+The runtime exposes an HTTP API for:
 
-Phase 6 adds direct, bounded messages between registered agents. A message is explicitly addressed and
-stored only in the recipient's in-memory inbox; sending a message never grants tool permissions or starts
-work in the recipient agent.
+- creating agents and assigning capabilities such as `filesystem_read`, `network_http`, and
+  `shell_execute`;
+- submitting generic asynchronous tasks;
+- running tools through permission checks, timeouts, and retries;
+- storing and searching agent-scoped memory;
+- sending direct messages between registered agents;
+- reading runtime status and recent events;
+- scaling execution across separate durable worker processes.
 
-Phase 7 has begun with a PostgreSQL durable task queue. Its claim/lease protocol lets independent worker
-processes atomically claim work, renew a lease, and acknowledge completion with an unguessable lease token.
-Set the durable-queue flag on the API process and run one or more separate worker processes to enable it.
+The default executable uses a mock generic task executor, so generic tasks are useful for exercising
+the runtime lifecycle. Tool tasks are real: `echo`, `file_read`, `http_request`, and, when configured,
+host process tools or Docker sandbox execution.
 
-## Run
+## Quick Start
+
+Run the local development server:
 
 ```sh
 cargo run
 ```
 
-The API listens on `127.0.0.1:3000` by default. Set `AGENT_RUNTIME_ADDR` to bind a different address.
+The API listens on `127.0.0.1:3000` unless `AGENT_RUNTIME_ADDR` is set.
 
-## Phase 1 API
+Create an agent:
+
+```sh
+curl -s -X POST http://127.0.0.1:3000/agents \
+  -H 'content-type: application/json' \
+  -d '{"name":"research-agent","permissions":["filesystem_read","network_http"]}'
+```
+
+Run the built-in `echo` tool for that agent:
+
+```sh
+curl -s -X POST http://127.0.0.1:3000/agents/{agent_id}/tools \
+  -H 'content-type: application/json' \
+  -d '{"tool":"echo","arguments":{"message":"hello runtime"}}'
+```
+
+The tool endpoint returns a task immediately. Poll the returned task ID until it reaches a terminal
+state:
+
+```sh
+curl -s http://127.0.0.1:3000/tasks/{task_id}
+```
+
+Check runtime health:
+
+```sh
+curl -s http://127.0.0.1:3000/runtime/status
+```
+
+## API
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/agents` | Create and initialize a ready agent. |
-| `GET` | `/agents/{id}` | Retrieve an agent's lifecycle state. |
+| `POST` | `/agents` | Create a ready agent. |
+| `GET` | `/agents/{id}` | Get an agent. |
+| `POST` | `/agents/{id}/tasks` | Submit an asynchronous task owned by an agent. |
+| `POST` | `/agents/{id}/tools` | Queue a permission-checked tool task. |
 | `POST` | `/agents/{id}/memory` | Write or replace an agent-scoped memory record. |
 | `GET` | `/agents/{id}/memory` | List active memory records for an agent. |
-| `GET` | `/agents/{id}/memory/{key}?scope=working` | Retrieve a scoped memory record. |
-| `GET` | `/agents/{id}/memory/search?q=cloud&limit=10` | Semantically retrieve matching memory records. |
-| `POST` | `/agents/{id}/tasks` | Submit an asynchronous task for an agent. |
-| `POST` | `/agents/{id}/tools` | Queue a permission-checked tool task for an agent. |
-| `POST` | `/agents/{id}/messages` | Send a message from this agent to another registered agent. |
-| `GET` | `/agents/{id}/messages?limit=100` | List the agent's most recent inbox messages. |
+| `GET` | `/agents/{id}/memory/{key}?scope=working` | Get one memory record. |
+| `GET` | `/agents/{id}/memory/search?q=plan&limit=10` | Search memory semantically. |
+| `POST` | `/agents/{id}/messages` | Send a direct message from one agent to another. |
+| `GET` | `/agents/{id}/messages?limit=100` | List an agent's inbox. |
 | `POST` | `/tasks` | Submit an unowned asynchronous task. |
-| `GET` | `/tasks/{id}` | Retrieve the latest task state and result. |
+| `GET` | `/tasks/{id}` | Get task state and result. |
 | `POST` | `/tasks/{id}/cancel` | Cancel a queued or running task. |
-| `GET` | `/runtime/status` | Retrieve queue, task, agent, and worker counts. |
-| `GET` | `/runtime/events?limit=100` | List the most recent runtime events. |
+| `GET` | `/runtime/status` | Get queue, task, agent, worker, and sandbox status. |
+| `GET` | `/runtime/events?limit=100` | List recent runtime events. |
 | `GET` | `/tools` | List registered tools and required capabilities. |
 
-Example:
+### Generic Tasks
 
 ```sh
-curl -X POST http://127.0.0.1:3000/agents \
+curl -s -X POST http://127.0.0.1:3000/tasks \
   -H 'content-type: application/json' \
-  -d '{"name":"research-agent","permissions":["network_http","filesystem_read"]}'
+  -d '{"name":"demo-task","payload":{"work":"example"},"priority":"Normal"}'
 ```
 
-Permissions also accept the dotted names from the spec (`filesystem.read`, `network.http`,
-`shell.execute`, `python.execute`).
+### Memory
 
-## Phase 2 tools
-
-`echo` does not need a capability. `file_read` requires `filesystem_read` and can only read text files
-inside `AGENT_RUNTIME_TOOL_ROOT` (the current directory by default). `http_request` requires
-`network_http` and only connects to exact hostnames in `AGENT_RUNTIME_ALLOWED_HTTP_HOSTS`. Redirects
-are disabled so an allowlisted host cannot redirect the request to another destination.
-
-Tool requests are scheduled like every other task: the endpoint returns `202 Accepted`, then retrieve the
-result through `GET /tasks/{id}`. Shell and Python tools are disabled by default until Phase 3 sandbox
-isolation. They can only be enabled for local development with the explicit
-`AGENT_RUNTIME_ENABLE_HOST_PROCESS_TOOLS=true` opt-in.
-
-## Phase 3 Docker sandbox
-
-Set `AGENT_RUNTIME_DOCKER_IMAGE` to register `sandbox.exec`. It requires the agent's `shell_execute`
-capability and runs an allowlisted task inside a Docker container with a read-only workspace mount,
-read-only root filesystem, no network, all Linux capabilities dropped, `no-new-privileges`, CPU/memory
-limits, a PID limit, an unprivileged user, and a bounded `noexec` temporary filesystem. Docker must be
-installed and its daemon must be running.
+Memory is isolated by agent and scope. `working` memory is the default and can expire with `ttl_ms`.
+`persistent` memory is intended for longer-lived records. Search uses a deterministic built-in
+vector-style similarity function, so it does not need an embedding service.
 
 ```sh
-AGENT_RUNTIME_DOCKER_IMAGE="alpine:3.21" cargo run
+curl -s -X POST http://127.0.0.1:3000/agents/{agent_id}/memory \
+  -H 'content-type: application/json' \
+  -d '{"key":"current_plan","value":["research","report"],"scope":"working","ttl_ms":60000}'
 ```
 
 ```sh
+curl -s 'http://127.0.0.1:3000/agents/{agent_id}/memory/search?q=research&scope=working&limit=5'
+```
+
+### Messages
+
+Messages are direct and bounded. The recipient must already exist, and messages do not grant
+permissions or automatically start work.
+
+```sh
+curl -s -X POST http://127.0.0.1:3000/agents/{sender_id}/messages \
+  -H 'content-type: application/json' \
+  -d '{"to_agent_id":"{recipient_id}","topic":"handoff","payload":{"task":"review"}}'
+```
+
+## Tools And Permissions
+
+Tool execution always checks the target agent's permissions before running. Permission names can use
+underscores or the dotted aliases from the spec, for example `filesystem_read` or `filesystem.read`.
+
+| Tool | Capability | Notes |
+| --- | --- | --- |
+| `echo` | none | Returns the supplied JSON arguments. |
+| `file_read`, `file.read` | `filesystem_read` | Reads UTF-8 files under `AGENT_RUNTIME_TOOL_ROOT`. |
+| `http_request`, `http.get` | `network_http` | Allows only exact hosts from `AGENT_RUNTIME_ALLOWED_HTTP_HOSTS`; redirects are disabled. |
+| `shell` | `shell_execute` | Disabled unless `AGENT_RUNTIME_ENABLE_HOST_PROCESS_TOOLS=true`. Runs only allowlisted programs. |
+| `python` | `python_execute` | Disabled unless `AGENT_RUNTIME_ENABLE_HOST_PROCESS_TOOLS=true`. Runs scripts under the tool root. |
+| `sandbox.exec` | `shell_execute` | Enabled when `AGENT_RUNTIME_DOCKER_IMAGE` is set. Runs inside a locked-down Docker container. |
+
+Read a file from the configured tool root:
+
+```sh
+AGENT_RUNTIME_TOOL_ROOT="$PWD" cargo run
+```
+
+```sh
+curl -s -X POST http://127.0.0.1:3000/agents/{agent_id}/tools \
+  -H 'content-type: application/json' \
+  -d '{"tool":"file_read","arguments":{"path":"README.md"}}'
+```
+
+Allow outbound HTTP to selected hosts:
+
+```sh
+AGENT_RUNTIME_ALLOWED_HTTP_HOSTS="api.github.com,example.com" cargo run
+```
+
+```sh
+curl -s -X POST http://127.0.0.1:3000/agents/{agent_id}/tools \
+  -H 'content-type: application/json' \
+  -d '{"tool":"http_request","arguments":{"url":"https://example.com"}}'
+```
+
+## Docker Sandbox
+
+Set `AGENT_RUNTIME_DOCKER_IMAGE` to register `sandbox.exec`. Docker must be installed, the daemon must
+be running, and the image must already be available or pullable by Docker.
+
+```sh
+docker pull alpine:3.21
+
 AGENT_RUNTIME_TOOL_ROOT="$PWD" \
-AGENT_RUNTIME_ALLOWED_HTTP_HOSTS="api.github.com,example.com" \
+AGENT_RUNTIME_DOCKER_IMAGE="alpine:3.21" \
 cargo run
 ```
 
-Tool aliases `file.read` and `http.get` remain valid for existing clients.
+The sandbox backend mounts the tool root read-only, disables network access, drops Linux capabilities,
+uses `no-new-privileges`, applies CPU and memory limits, sets a PID limit, runs as an unprivileged user,
+and uses a bounded `noexec` temporary filesystem. If the sandbox is not configured, `sandbox.exec` is
+not registered.
 
-## Phase 4 memory
+## Persistent Memory
 
-Memory records are isolated by agent and scope. `working` is the default scope and may include an optional
-`ttl_ms`; expired records are removed on access. By default, both scopes are process-local. Configure Redis
-and PostgreSQL to externalize working and persistent memory respectively:
+By default, memory is process-local. Set Redis and/or PostgreSQL URLs to externalize it:
 
 ```sh
 AGENT_RUNTIME_REDIS_URL="redis://127.0.0.1:6379" \
@@ -114,72 +194,71 @@ AGENT_RUNTIME_DATABASE_URL="postgres://user:password@127.0.0.1:5432/agent_runtim
 cargo run
 ```
 
-Semantic search uses deterministic hashed-vector cosine similarity across memory values. It is built in and
-does not require an embedding API; a dedicated vector-database adapter can replace it without changing the
-runtime or HTTP API.
+Redis backs working memory. PostgreSQL backs persistent memory and is also used for migrations and
+durable task queues when durable mode is enabled.
+
+## Durable Workers
+
+Durable mode separates the API process from worker processes. The API stores agents and enqueues work in
+PostgreSQL. Workers atomically claim tasks with `SKIP LOCKED`, renew leases while work is running, and
+acknowledge terminal task snapshots with an unguessable lease token.
+
+Start the API/control-plane process:
 
 ```sh
-curl -X POST http://127.0.0.1:3000/agents/{agent_id}/memory \
-  -H 'content-type: application/json' \
-  -d '{"key":"current_plan","value":["research","report"],"scope":"working","ttl_ms":60000}'
-```
-
-## PostgreSQL task storage
-
-`PostgresStorage` is an SDK-facing adapter. Create it with `PostgresStorage::connect`, call `migrate`,
-then use the `TaskStorage` trait for task CRUD. It serializes each runtime task as JSONB while preserving
-UUID and timestamp columns for indexing. The initial migration is in `migrations/0001_create_tasks.sql`.
-
-For Phase 7, the same adapter exposes `enqueue`, `claim_next`, `renew_lease`, and `acknowledge`. Claiming
-uses PostgreSQL row locking with `SKIP LOCKED`, so concurrent workers cannot receive the same available
-task. A lease includes a worker ID, expiry, and random token; renewals and acknowledgements must match that
-token and fail safely if the lease has expired or been reclaimed. An expired running task is returned to the
-queued state before a new worker receives it. The queue schema is in
-`migrations/0003_create_task_leases.sql`.
-
-`DistributedWorker` is the lease-aware SDK worker loop for this queue. It marks a claimed task as running,
-renews the lease at half its configured duration while its executor runs, and acknowledges only a terminal
-task snapshot. The loop can be stopped with a Tokio `watch` signal.
-
-Enable the API's durable mode with a PostgreSQL URL. It persists agents (including their permissions) and
-enqueues tasks without starting a local worker pool. Start a separate process for each durable worker; it
-re-loads an agent's persisted permissions before executing a tool task. Local scheduling remains the default
-when `AGENT_RUNTIME_DURABLE_QUEUE` is absent.
-
-```sh
-# API / control-plane process
 AGENT_RUNTIME_DURABLE_QUEUE=true \
 AGENT_RUNTIME_DATABASE_URL="postgres://user:password@127.0.0.1:5432/agent_runtime" \
 cargo run
+```
 
-# One worker process (run in another terminal; repeat to scale out)
+Start one or more worker processes in separate terminals:
+
+```sh
 AGENT_RUNTIME_WORKER_ID="worker-1" \
 AGENT_RUNTIME_DATABASE_URL="postgres://user:password@127.0.0.1:5432/agent_runtime" \
 cargo run
 ```
 
-Do not set `AGENT_RUNTIME_DURABLE_QUEUE` on worker processes. The worker-mode selector is
-`AGENT_RUNTIME_WORKER_ID`; that mode does not bind the HTTP listener.
+Do not set `AGENT_RUNTIME_DURABLE_QUEUE` on worker processes. Worker mode is selected by
+`AGENT_RUNTIME_WORKER_ID`, and it does not bind the HTTP listener.
 
-Each worker registers a heartbeat in PostgreSQL on startup, while idle, and after each task. In durable
-mode, `GET /runtime/status` exposes `durable_workers`, counting heartbeats seen within the last 90 seconds.
+In durable mode, `GET /runtime/status` includes `durable_workers`, counted from PostgreSQL heartbeats
+seen in the last 90 seconds.
 
-## Phase 5 event bus
+## Configuration
 
-`EventBus` is exposed through `AgentRuntime::subscribe_events()` for in-process consumers. Its typed
-events have a monotonic ID, timestamp, event kind, optional agent/task IDs, and a JSON snapshot payload.
-The `GET /runtime/events` endpoint returns the retained history in chronological order; the default limit
-is 100 and the maximum is 1,024. The history is intentionally process-local and bounded, so it is useful
-for control-plane clients and diagnostics but is not a replacement for a durable broker.
+| Variable | Purpose |
+| --- | --- |
+| `AGENT_RUNTIME_ADDR` | API bind address. Default: `127.0.0.1:3000`. |
+| `AGENT_RUNTIME_TOOL_ROOT` | Root directory for file, shell, Python, and Docker-sandbox tools. Default: current directory. |
+| `AGENT_RUNTIME_ALLOWED_HTTP_HOSTS` | Comma-separated host allowlist for `http_request`. |
+| `AGENT_RUNTIME_ENABLE_HOST_PROCESS_TOOLS` | Enables host `shell` and `python` tools when set to `true`, `TRUE`, or `1`. |
+| `AGENT_RUNTIME_ALLOWED_SHELL_PROGRAMS` | Comma-separated allowlist for the host `shell` tool. |
+| `AGENT_RUNTIME_PYTHON_BIN` | Python executable for the host `python` tool. Default: `python3`. |
+| `AGENT_RUNTIME_DOCKER_IMAGE` | Enables `sandbox.exec` using this Docker image. |
+| `AGENT_RUNTIME_REDIS_URL` | Redis URL for working memory. |
+| `AGENT_RUNTIME_DATABASE_URL` | PostgreSQL URL for persistent memory, migrations, durable queue, and workers. |
+| `AGENT_RUNTIME_DATABASE_MAX_CONNECTIONS` | PostgreSQL pool size. Default: `5`. |
+| `AGENT_RUNTIME_DURABLE_QUEUE` | Enables durable queue mode on the API process. |
+| `AGENT_RUNTIME_WORKER_ID` | Starts this process as a durable worker instead of an API server. |
 
-## Phase 6 multi-agent messaging
+## Development
 
-Send a message by addressing the sender's messages endpoint. The recipient must already exist, and can
-read only its own inbox. Each inbox retains its most recent 1,000 messages, in chronological order. A
-successful delivery also emits a `message_sent` runtime event.
+Run the standard checks:
 
 ```sh
-curl -X POST http://127.0.0.1:3000/agents/{sender_id}/messages \
-  -H 'content-type: application/json' \
-  -d '{"to_agent_id":"{recipient_id}","topic":"handoff","payload":{"task":"review"}}'
+cargo fmt --check
+cargo test
+cargo clippy -- -D warnings
 ```
+
+PostgreSQL and Redis integration tests are opt-in:
+
+```sh
+AGENT_RUNTIME_TEST_DATABASE_URL="postgres://user:password@127.0.0.1:5432/agent_runtime_test" \
+AGENT_RUNTIME_TEST_REDIS_URL="redis://127.0.0.1:6379" \
+cargo test
+```
+
+Migrations live in `migrations/`. They create task storage, memory storage, durable queue leases,
+persisted agents, and worker heartbeats.
